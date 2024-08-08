@@ -4,6 +4,12 @@
 #include <string>
 #include <vector>
 
+#include <linux/fs.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
 extern "C" {
 #include <libavutil/imgutils.h>
 #include <libavutil/samplefmt.h>
@@ -16,9 +22,42 @@ extern "C" {
 #include <opencv2/objdetect.hpp>
 #include <opencv2/highgui.hpp>
 
+#include <mp4v2/mp4v2.h>
+
 static inline AVRounding operator|(AVRounding a, AVRounding b)
 {
     return static_cast<AVRounding>(static_cast<int>(a) | static_cast<int>(b));
+}
+
+/*
+ * Copies with a reflink.  This comes from
+ * <https://gitlab.com/rubdos/pyreflink/-/blob/master/reflink/linux.c?ref_type=heads>.
+ */
+static void reflink_copy(std::string input_filename, std::string output_filename)
+{
+    unlink(output_filename.c_str());
+
+    int old_fd = open(input_filename.c_str(), O_RDONLY);
+    int new_fd = open(output_filename.c_str(), O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR);
+
+    if (ioctl(new_fd, FICLONE, old_fd) != 0) {
+        perror("unable to ioctl");
+        abort();
+    }
+
+    close(new_fd);
+    close(old_fd);
+
+    struct stat st;
+    if (stat(input_filename.c_str(), &st) != 0) {
+        perror("unable to state");
+        abort();
+    }
+
+    if (chmod(output_filename.c_str(), st.st_mode) != 0) {
+        perror("unable to chmod");
+        abort();
+    }
 }
 
 class detection {
@@ -228,96 +267,26 @@ void correct(std::string input_filename, std::vector<detection>& detections)
     /* Cleans up the timecode */
     auto fixed_timecode = fix_timecode(timecode, detections);
 
-    /* Creates a new output file, so we can remux everything with the new
-     * metadata.  This is all basically copied from
-     * <https://github.com/leandromoreira/ffmpeg-libav-tutorial/blob/master/2_remuxing.c>.
-     */
-    std::string output_filename = input_filename + "-octavious.mkv";
-    AVFormatContext *output_format_context = NULL;
+    /* Make a reflink copy and then edit that in-place. */
+    auto output_filename = input_filename + "-octavious.mp4";
+    reflink_copy(input_filename, output_filename);
 
-    if (avformat_alloc_output_context2(&output_format_context, NULL, NULL, output_filename.c_str()) < 0) {
-        perror("Unable to allocate output context");
+    MP4FileHandle output_file = MP4Modify(output_filename.c_str(), 0);
+    if (output_file == MP4_INVALID_FILE_HANDLE) {
+        perror("unable to open output output_file");
         abort();
     }
 
-    std::vector<bool> process_stream(input_format_context->nb_streams);
-    for (size_t i = 0; i < input_format_context->nb_streams; ++i) {
-        AVStream *input_stream = input_format_context->streams[i];
+    for (size_t i = 0; i < MP4GetNumberOfTracks(output_file); ++i) {
+        auto track_id = MP4FindTrackId(output_file, i);
 
-        /*
-         * FFmpeg won't let me copy the Sony data streams over, so just stick
-         * to what it actually supports and I care about.
-         */
-        process_stream[i] = false;
-        switch (input_stream->codecpar->codec_type) {
-            case AVMEDIA_TYPE_AUDIO:
-            case AVMEDIA_TYPE_VIDEO:
-                process_stream[i] = true;
-        }
-
-        if (!process_stream[i])
+        uint8_t *data;
+        uint32_t data_size;
+        if (!MP4GetTrackVideoMetadata(output_file, track_id, &data, &data_size))
             continue;
-
-        AVStream *output_stream = avformat_new_stream(output_format_context, NULL);
-        if (!output_stream) {
-            perror("Unable to create output stream");
-            abort();
-        }
-
-        if (avcodec_parameters_copy(output_stream->codecpar, input_stream->codecpar) < 0) {
-            perror("unable to copy codec parameters");
-            abort();
-        }
-
-        if (output_stream->codecpar->codec_tag == 0x736F7774)
-            output_stream->codecpar->codec_tag = 0;
-
-        const AVDictionaryEntry *meta_iter = NULL;
-        while (meta_iter = av_dict_iterate(input_stream->metadata, meta_iter)) {
-            std::string value = meta_iter->value;
-            if (strcmp(meta_iter->key, "timecode") == 0)
-                value = fixed_timecode;
-
-            av_dict_set(&output_stream->metadata, meta_iter->key, value.c_str(), 0);
-        }
     }
 
-    av_dump_format(output_format_context, 0, output_filename.c_str(), 1);
-
-    if (avio_open(&output_format_context->pb, output_filename.c_str(), AVIO_FLAG_WRITE) < 0) {
-        perror("Unable to open output file");
-        abort();
-    }
-
-    if (avformat_write_header(output_format_context, NULL) < 0) {
-        perror("Unable to write output header");
-        abort();
-    }
-
-    AVPacket packet;
-    while (av_read_frame(input_format_context, &packet) >= 0) {
-        auto input_stream = input_format_context->streams[packet.stream_index];
-
-        if (!process_stream[packet.stream_index])
-            continue;
-
-        auto output_stream = output_format_context->streams[packet.stream_index];
-
-        packet.pts = av_rescale_q_rnd(packet.pts, input_stream->time_base, output_stream->time_base, AV_ROUND_NEAR_INF|AV_ROUND_PASS_MINMAX);
-        packet.dts = av_rescale_q_rnd(packet.dts, input_stream->time_base, output_stream->time_base, AV_ROUND_NEAR_INF|AV_ROUND_PASS_MINMAX);
-        packet.duration = av_rescale_q(packet.duration, input_stream->time_base, output_stream->time_base);
-        packet.pos = -1;
-
-        if (av_interleaved_write_frame(output_format_context, &packet) < 0) {
-            perror("Unable to write output frame");
-            abort();
-        }
-    }
-
-    if (av_write_trailer(output_format_context) < 0) {
-        perror("Unable to write output trailer");
-        abort();
-    }
+    MP4Close(output_file, 0);
 }
 
 int main(int argc, char **argv)
