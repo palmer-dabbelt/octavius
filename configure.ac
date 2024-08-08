@@ -16,6 +16,4 @@ AC_CHECK_LIB([swscale], [sws_getCachedContext])
 
 PKG_CHECK_MODULES(OPENCV, [opencv4])
 
-AC_CHECK_LIB([mp4v2], [MP4Modify])
-
 AC_OUTPUT
