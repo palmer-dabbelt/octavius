@@ -394,8 +394,6 @@ void correct(std::string input_filename, std::vector<detection>& detections)
         av_dict_set(&output_stream->metadata, "timecode", fixed_timecode.c_str(), 0);
     }
 
-    av_dump_format(output_format_context, 0, output_filename.c_str(), 1);
-
     if (avio_open(&output_format_context->pb, output_filename.c_str(), AVIO_FLAG_WRITE) < 0) {
         perror("Unable to open output file");
         abort();
