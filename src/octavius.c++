@@ -16,21 +16,125 @@ extern "C" {
 #include <opencv2/objdetect.hpp>
 #include <opencv2/highgui.hpp>
 
+double fps = 29.97;
+long offset = 0;
+
 static inline AVRounding operator|(AVRounding a, AVRounding b)
 {
     return static_cast<AVRounding>(static_cast<int>(a) | static_cast<int>(b));
 }
 
-class detection {
+class file_timecode {
+private:
+    long _milliseconds;
+
 public:
-    detection(std::string base_timecode, std::string qr_timecode, long frame_offset)
+    file_timecode(std::string base_timecode, long frame_offset=0)
     {
+        int hh, mm, ss, ff;
+        char dummy;
+
+        if (sscanf(base_timecode.c_str(), "%02d:%02d:%02d:%02d", &hh, &mm, &ss, &ff, &dummy) != 4) {
+            perror("Unable to parse file timecode");
+            abort();
+        }
+
+        _milliseconds = (((((hh * 60) + mm) * 60) + ss) * 1000)
+                        + ((ff + frame_offset * 1000) / fps);
+    }
+
+    long operator-(const file_timecode& that) const
+    {
+        return _milliseconds - that._milliseconds;
     }
 };
 
-std::string fix_timecode(std::string timecode, const std::vector<detection>& detections)
+
+class qr_timecode {
+private:
+    long _milliseconds;
+
+    qr_timecode(long ms)
+    : _milliseconds(ms)
+    {}
+
+public:
+    qr_timecode(void)
+    {
+        _milliseconds = 0;
+    }
+
+    qr_timecode(std::string base_timecode)
+    {
+        int YY, MM, DD, hh, mm, ss, ms;
+
+        if (sscanf(base_timecode.c_str(), "oT%02d%02d%02d%02d%02d%02d.%03doTDoTZ-7", &YY, &MM, &DD, &hh, &mm, &ss, &ms) != 7) {
+            perror("Unable to parse QR timecode");
+            abort();
+        }
+
+        _milliseconds = (((((hh * 60) + mm) * 60) + ss) * 1000) + ms + offset;
+    }
+
+    std::string as_metadata_string(void) const
+    {
+        char timecode[128];
+        int ff = (_milliseconds % 1000) / fps;
+        int ss = (_milliseconds / 1000) % 60;
+        int mm = (_milliseconds / (60 * 1000)) % 60;
+        int hh = (_milliseconds / (60 * 60 * 1000)) % 60;
+        snprintf(timecode, 128, "%02d:%02d:%02d;%02d", hh, mm, ss, ff);
+        return timecode;
+    }
+
+    qr_timecode operator+(long milliseconds) const
+    {
+        return qr_timecode(_milliseconds + milliseconds);
+    }
+
+    qr_timecode operator-(long milliseconds) const
+    {
+        return qr_timecode(_milliseconds - milliseconds);
+    }
+};
+
+class detection {
+private:
+    file_timecode _file_timecode;
+    qr_timecode _qr_timecode;
+
+public:
+    detection(std::string base_timecode, std::string qr_timecode, long frame_offset)
+    : _file_timecode(base_timecode, frame_offset),
+      _qr_timecode(qr_timecode)
+    {
+    }
+
+    long delta_ms(const file_timecode& that) const
+    {
+        return _file_timecode - that;
+    }
+
+    qr_timecode map(const file_timecode& that) const
+    {
+        return _qr_timecode - delta_ms(that);
+    }
+};
+
+std::string fix_timecode(std::string timecode_string, const std::vector<detection>& detections)
 {
-    return timecode + "-fixed";
+    auto timecode = file_timecode(timecode_string);
+
+    long smallest_delta = LONG_MAX;
+    auto best_timecode = qr_timecode();
+    for (const auto& detection: detections) {
+        if (detection.delta_ms(timecode) < smallest_delta) {
+            smallest_delta = detection.delta_ms(timecode);
+            best_timecode = detection.map(timecode);
+        }
+    }
+
+    return best_timecode.as_metadata_string();
 }
 
 /*
@@ -154,13 +258,12 @@ void detect(std::string filename, std::vector<detection>& detections)
         abort();
     }
 
-    return;
-
     /* The QR code detector. */
     auto qr_decoder = cv::QRCodeDetector();
 
     /* Reads the entire video stream, looking for QR codes. */
     long frame_count = 0;
+    long qr_codes = 0;
     while (av_read_frame(format_context, packet) >= 0) {
         if (packet->stream_index != video_stream_index)
             continue;
@@ -183,8 +286,14 @@ void detect(std::string filename, std::vector<detection>& detections)
                              bgr_frame->linesize[0]);
 
             auto qr_string = qr_decoder.detectAndDecode(cv_frame);
-            if (qr_string != "")
+            if (qr_string != "") {
+                fprintf(stderr, "Found QR timecode at frame %ld: %s\n", frame_count, qr_string.c_str());
+
                 detections.push_back(detection(timecode, qr_string, frame_count));
+                qr_codes++;
+            }
+
+            frame_count++;
         }
 
         av_packet_unref(packet);
@@ -269,17 +378,20 @@ void correct(std::string input_filename, std::vector<detection>& detections)
             abort();
         }
 
+        /*
+         * FFmpeg doesn't like the Sony "twos" name for pcm_s16be.  No idea
+         * why, but just setting it to 0 seems to work thinsg out.
+         */
         if (output_stream->codecpar->codec_tag == 0x736F7774)
             output_stream->codecpar->codec_tag = 0;
 
-        const AVDictionaryEntry *meta_iter = NULL;
-        while (meta_iter = av_dict_iterate(input_stream->metadata, meta_iter)) {
-            std::string value = meta_iter->value;
-            if (strcmp(meta_iter->key, "timecode") == 0)
-                value = fixed_timecode;
-
-            av_dict_set(&output_stream->metadata, meta_iter->key, value.c_str(), 0);
-        }
+        /*
+         * The time-based metadata stream will have disappeared, which contains
+         * the timecode metadata header.  So just add the fixed timecode to
+         * every stream.
+         */
+        av_dict_copy(&output_stream->metadata, input_stream->metadata, 0);
+        av_dict_set(&output_stream->metadata, "timecode", fixed_timecode.c_str(), 0);
     }
 
     av_dump_format(output_format_context, 0, output_filename.c_str(), 1);
