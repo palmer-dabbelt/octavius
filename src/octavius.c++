@@ -279,19 +279,22 @@ void detect(std::string filename, std::vector<detection>& detections)
                       0, input_frame->height,
                       bgr_frame->data, bgr_frame->linesize);
             
-            cv::Mat cv_frame(video_decoder_context->height,
-                             video_decoder_context->width,
-                             CV_8UC3,
-                             bgr_frame->data[0],
-                             bgr_frame->linesize[0]);
+	    try {
+                cv::Mat cv_frame(video_decoder_context->height,
+                                 video_decoder_context->width,
+                                 CV_8UC3,
+                                 bgr_frame->data[0],
+                                 bgr_frame->linesize[0]);
 
-            auto qr_string = qr_decoder.detectAndDecode(cv_frame);
-            if (qr_string != "") {
-                fprintf(stderr, "Found QR timecode at frame %ld: %s\n", frame_count, qr_string.c_str());
+                auto qr_string = qr_decoder.detectAndDecode(cv_frame);
+                if (qr_string != "") {
+                    fprintf(stderr, "Found QR timecode at frame %ld: %s\n",
+                            frame_count, qr_string.c_str());
 
-                detections.push_back(detection(timecode, qr_string, frame_count));
-                qr_codes++;
-            }
+                    detections.push_back(detection(timecode, qr_string, frame_count));
+                    qr_codes++;
+                }
+            } catch (...) {}
 
             frame_count++;
         }
