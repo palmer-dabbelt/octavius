@@ -264,7 +264,7 @@ void detect(std::string filename, std::vector<detection>& detections)
     /* Reads the entire video stream, looking for QR codes. */
     long frame_count = 0;
     long qr_codes = 0;
-    while (av_read_frame(format_context, packet) >= 0) {
+    while (qr_codes < 8 && av_read_frame(format_context, packet) >= 0) {
         if (packet->stream_index != video_stream_index)
             continue;
 
