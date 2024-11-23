@@ -227,15 +227,20 @@ void detect(std::string filename, std::vector<detection>& detections)
         abort();
     }
 
-    /* Use the FFmpeg software scaler to do a colorspace conversion to BGR24,
-     * which is what OpenCV requires. */
+    /*
+     * Use the FFmpeg software scaler to do a colorspace conversion to BGR24,
+     * which is what OpenCV requires.  Also scale down to 720p, so the QR code
+     * detection is faster.
+     */
+    long scaled_width = 1280;
+    long scaled_height = 720;
     SwsContext *swscaler_context =
         sws_getCachedContext(NULL,
                              video_decoder_context->width,
                              video_decoder_context->height,
                              video_decoder_context->pix_fmt,
-                             video_decoder_context->width,
-                             video_decoder_context->height,
+			     scaled_width,
+			     scaled_height,
                              AV_PIX_FMT_BGR24,
                              SWS_BILINEAR,
                              NULL,
@@ -250,8 +255,8 @@ void detect(std::string filename, std::vector<detection>& detections)
 
     if (av_image_alloc(bgr_frame->data,
                    bgr_frame->linesize,
-                   video_decoder_context->width,
-                   video_decoder_context->height,
+		   scaled_width,
+		   scaled_height,
                    AV_PIX_FMT_BGR24,
                    32) < 0) {
         perror("unable to allocate BGR image");
@@ -280,8 +285,8 @@ void detect(std::string filename, std::vector<detection>& detections)
                       bgr_frame->data, bgr_frame->linesize);
             
 	    try {
-                cv::Mat cv_frame(video_decoder_context->height,
-                                 video_decoder_context->width,
+                cv::Mat cv_frame(scaled_height,
+                                 scaled_width,
                                  CV_8UC3,
                                  bgr_frame->data[0],
                                  bgr_frame->linesize[0]);
