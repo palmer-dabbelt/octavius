@@ -393,6 +393,13 @@ void correct(std::string input_filename, std::vector<detection>& detections)
         if (output_stream->codecpar->codec_tag == 0x736F7774)
             output_stream->codecpar->codec_tag = 0;
 
+	/*
+	 * I'm not sure why, but if I don't set "r_frame_rate" (aka "time base,
+	 * real" or TBR) in the output stream then I get a variable frame rate
+	 * output stream with a slightly wrong output framerate.
+	 */
+	output_stream->r_frame_rate = input_stream->r_frame_rate;
+
         /*
          * The time-based metadata stream will have disappeared, which contains
          * the timecode metadata header.  So just add the fixed timecode to
